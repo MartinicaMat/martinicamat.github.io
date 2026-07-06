@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Parade à Mains Nues: Championships</title>
+    <style>
+        body {
+            background-color: #1a1a1a;
+            color: white;
+            font-family: 'Courier New', Courier, monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        h1 {
+            color: #ffcc00;
+            text-shadow: 2px 2px #ff3300;
+            margin-bottom: 5px;
+        }
+        canvas {
+            border: 4px solid #ffcc00;
+            background-color: #2b2b2b;
+            box-shadow: 0px 0px 20px rgba(255, 204, 0, 0.5);
+        }
+        .instructions {
+            margin-top: 15px;
+            font-size: 18px;
+            color: #aaa;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>PARADE À MAINS NUES: CHAMPIONSHIPS</h1>
+    <div id="score" style="font-size: 24px; margin-bottom: 10px;">Score: 0 | Vies: 3</div>
+    
+    <!-- La zone de dessin du jeu -->
+    <canvas id="gameCanvas" width="800" height="400"></canvas>
+
+    <div class="instructions">Appuie sur <strong>ESPACE</strong> au moment de l'impact pour PARADER !</div>
+
+    <script>
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
+
+        // Variables du jeu
+        let score = 0;
+        let lives = 3;
+        let gameOver = false;
+
+        // Le Joueur (à droite)
+        const player = {
+            x: 650,
+            y: 150,
+            width: 50,
+            height: 100,
+            state: "IDLE", // IDLE ou PARRY
+            parryTimer: 0
+        };
+
+        // L'Attaque ennemie (qui vient de la gauche)
+        const attack = {
+            x: -50,
+            y: 185,
+            width: 40,
+            height: 30,
+            speed: 7,
+            active: true
+        };
+
+        // Écouteur de touches du clavier
+        window.addEventListener("keydown", function(event) {
+            if (event.code === "Space" && player.state === "IDLE" && !gameOver) {
+                player.state = "PARRY";
+                player.parryTimer = 15; // La parade dure 15 frames (~0.25 seconde, timing serré !)
+            }
+            if (event.code === "Space" && gameOver) {
+                // Relancer le jeu si on a perdu
+                document.location.reload();
+            }
+        });
+
+        // Boucle principale du jeu (s'exécute en continu)
+        function gameLoop() {
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // 1. Mise à jour des positions et logique
+        function update() {
+            if (gameOver) return;
+
+            // Gérer le timing de la parade du joueur
+            if (player.state === "PARRY") {
+                player.parryTimer--;
+                if (player.parryTimer <= 0) {
+                    player.state = "IDLE";
+                }
+            }
+
+            // Faire avancer l'attaque vers le joueur
+            if (attack.active) {
+                attack.x += attack.speed;
+
+                // Détection de collision / portée de parade
+                // Si l'attaque touche le bouclier virtuel du joueur
+                if (attack.x + attack.width >= player.x - 20 && attack.x <= player.x) {
+                    
+                    if (player.state === "PARRY") {
+                        // REUSSITE ! Parade parfaite !
+                        score++;
+                        attack.x = -100; // Reset l'attaque à gauche
+                        attack.speed += 0.8; // Augmente la vitesse pour corser le jeu
+                        player.state = "IDLE";
+                    } 
+                    else if (attack.x + attack.width >= player.x) {
+                        // ÉCHEC ! Le joueur s'est pris le coup
+                        lives--;
+                        attack.x = -100;
+                        if (lives <= 0) {
+                            gameOver = true;
+                        }
+                    }
+                }
+            }
+
+            // Mettre à jour le texte du score
+            document.getElementById("score").innerText = `Score: ${score} | Vies: ${lives}`;
+        }
+
+        // 2. Dessiner les éléments à l'écran
+        function draw() {
+            // Effacer l'écran précédent
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (gameOver) {
+                ctx.fillStyle = "red";
+                ctx.font = "40px 'Courier New'";
+                ctx.fillText("GAME OVER - CHAMPIONSHIP TERMINÉ", 50, 200);
+                ctx.fillStyle = "white";
+                ctx.font = "20px 'Courier New'";
+                ctx.fillText("Appuie sur ESPACE pour recommencer", 220, 250);
+                return;
+            }
+
+            // Dessiner l'attaque ennemie (Poing rouge)
+            ctx.fillStyle = "#ff3300";
+            ctx.fillRect(attack.x, attack.y, attack.width, attack.height);
+
+            // Dessiner le joueur (Change de couleur s'il parade)
+            if (player.state === "PARRY") {
+                ctx.fillStyle = "#00ffcc"; // Cyan brillant pendant la parade
+                ctx.fillRect(player.x, player.y, player.width, player.height);
+                
+                // Dessiner l'effet visuel des mains qui parent
+                ctx.strokeStyle = "#00ffcc";
+                ctx.lineWidth = 5;
+                ctx.strokeRect(player.x - 20, player.y - 10, 15, player.height + 20);
+            } else {
+                ctx.fillStyle = "#ffffff"; // Blanc en temps normal
+                ctx.fillRect(player.x, player.y, player.width, player.height);
+            }
+        }
+
+        // Lancement du jeu
+        gameLoop();
+    </script>
+</body>
+</html>
