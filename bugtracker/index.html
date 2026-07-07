@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MartinicaMat - Bug Tracker</title>
+    <style>
+        body { background-color: #111827; color: #f3f4f6; font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
+        h1, h2 { color: #10b981; }
+        .box { background-color: #1f2937; padding: 20px; border-radius: 8px; margin-bottom: 30px; border: 1px solid #374151; }
+        label { display: block; margin: 10px 0 5px; color: #9ca3af; }
+        select, input, textarea { width: 100%; padding: 10px; background: #374151; border: 1px solid #4b5563; border-radius: 4px; color: white; box-sizing: border-box; }
+        textarea { height: 80px; resize: vertical; }
+        button { background: #10b981; color: white; border: none; padding: 12px 20px; border-radius: 4px; font-weight: bold; cursor: pointer; margin-top: 15px; width: 100%; }
+        button:hover { background: #059669; }
+        .bug-item { background: #1f2937; padding: 15px; border-radius: 6px; margin-bottom: 15px; border-left: 5px solid #10b981; }
+        .bug-meta { font-size: 12px; color: #9ca3af; margin-bottom: 8px; }
+        .status-msg { margin-top: 10px; font-weight: bold; text-align: center; display: none; }
+    </style>
+</head>
+<body>
+
+    <h1>🪲 Bug Tracker</h1>
+    
+    <div class="box">
+        <h2>Signaler un bug</h2>
+        <form id="bugForm">
+            <label for="pack">Datapack concerné :</label>
+            <select id="pack" required>
+                <option value="Defi Shulker">Defi Shulker</option>
+                <option value="Abstraction">Abstraction</option>
+            </select>
+
+            <label for="discord">Ton pseudo Discord :</label>
+            <input type="text" id="discord" placeholder="Ex: martinica_mat" required>
+
+            <label for="description">Description du bug :</label>
+            <textarea id="description" placeholder="Explique le problème ici..." required></textarea>
+
+            <button type="submit" id="submitBtn">Envoyer le rapport</button>
+            <div id="statusMsg" class="status-msg"></div>
+        </form>
+    </div>
+
+    <h2>Mes signalements récents</h2>
+    <div id="bugList">Aucun bug signalé depuis ce navigateur.</div>
+
+<script>
+const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1524079694708871308/wSwEtFoypmGF_0ZdXYmte2hhAs65v4kTAJ4rmiRJ-fnvmiv4YGhaOM_f9tH1lJzfYmeE";
+
+// 1. Charger les bugs locaux au démarrage
+function loadLocalBugs() {
+    const container = document.getElementById('bugList');
+    const localBugs = JSON.parse(localStorage.getItem('my_reported_bugs')) || [];
+    
+    if (localBugs.length === 0) {
+        container.innerHTML = "<p style='color: #9ca3af;'>Aucun bug signalé depuis ce navigateur.</p>";
+        return;
+    }
+    
+    container.innerHTML = "";
+    localBugs.forEach(bug => {
+        const div = document.createElement('div');
+        div.className = 'bug-item';
+        div.innerHTML = `
+            <div class="bug-meta">Pack : <strong>${bug.pack}</strong> | Discord : <code>${bug.discord}</code></div>
+            <p style="margin: 5px 0 0 0; white-space: pre-line; color: #d1d5db;">${bug.desc}</p>
+        `;
+        container.appendChild(div);
+    });
+}
+
+// 2. Gestion de l'envoi du formulaire
+document.getElementById('bugForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    
+    const submitBtn = document.getElementById('submitBtn');
+    const statusMsg = document.getElementById('statusMsg');
+    
+    const pack = document.getElementById('pack').value;
+    const discord = document.getElementById('discord').value;
+    const desc = document.getElementById('description').value;
+    
+    submitBtn.disabled = true;
+    submitBtn.innerText = "Envoi en cours...";
+
+    // Structure propre du message pour Discord (Rich Embed)
+    const discordPayload = {
+        embeds: [{
+            title: `🪲 Nouveau Bug Signalé !`,
+            color: 16730624, // Couleur orange/rouge
+            fields: [
+                { name: "📦 Datapack", value: pack, inline: true },
+                { name: "💬 Discord", value: `\`${discord}\``, inline: true },
+                { name: "📝 Description", value: desc }
+            ],
+            timestamp: new Date().toISOString()
+        }]
+    };
+
+    try {
+        // Envoi de la requête au webhook Discord
+        const response = await fetch(DISCORD_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(discordPayload)
+        });
+
+        if (response.ok) {
+            statusMsg.style.color = "#10b981";
+            statusMsg.innerText = "✅ Bug envoyé avec succès sur Discord !";
+            statusMsg.style.display = "block";
+            
+            // Sauvegarder localement pour l'affichage
+            const localBugs = JSON.parse(localStorage.getItem('my_reported_bugs')) || [];
+            localBugs.unshift({ pack, discord, desc });
+            localStorage.setItem('my_reported_bugs', JSON.stringify(localBugs));
+            
+            // Reset du formulaire
+            document.getElementById('bugForm').reset();
+            loadLocalBugs();
+        } else {
+            throw new Error("Erreur Discord");
+        }
+    } catch (error) {
+        statusMsg.style.color = "#ef4444";
+        statusMsg.innerText = "❌ Erreur lors de l'envoi. Vérifie le Webhook.";
+        statusMsg.style.display = "block";
+    } finally {
+        submitBtn.disabled = false;
+        submitBtn.innerText = "Envoyer le rapport";
+    }
+});
+
+// Initialisation
+loadLocalBugs();
+</script>
+
+</body>
+</html>
