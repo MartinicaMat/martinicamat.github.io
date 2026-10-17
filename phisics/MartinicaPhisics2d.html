@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Moteur physique 2D</title>
+  <style>
+    body { margin: 0; background: #0b0c12; color: #ddd; font: 14px system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; padding: 16px; }
+    #container canvas { border-radius: 8px; display: block; touch-action: none; }
+    .bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; justify-content: center; }
+    button { background: #23263a; color: #eee; border: 1px solid #383c58; border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+    button:hover { background: #2f3350; }
+    p { color: #888; margin: 4px 0; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <button id="reset">Réinitialiser</button>
+    <button id="pyramid">Pyramide</button>
+    <button id="rain">Pluie de formes</button>
+    <button id="wire">Wireframes</button>
+    <button id="contacts">Contacts</button>
+    <button id="pause">Pause</button>
+  </div>
+  <div id="container"></div>
+  <p>Glisse un objet pour le lancer · clique dans le vide pour créer une forme</p>
+  <p id="stats"></p>
+
+  <script>
+/**
+ * Physique — moteur physique 2D léger inspiré de Matter.js (aucune dépendance)
+ *
+ * - Corps rigides convexes (rectangles, cercles, polygones, sommets libres)
+ * - Détection : broadphase AABB + SAT (Separating Axis Theorem) + clipping des contacts
+ * - Résolution : impulsions séquentielles (normale + friction de Coulomb),
+ *   restitution, warm starting et correction de position
+ * - Rendu canvas, boucle d'animation, événements, glisser-déposer à la souris
+ *
+ * Unités : pixels, millisecondes pour Engine.update (comme Matter.js),
+ * vitesses en px/s, gravité { x, y, scale } avec accélération = y * scale * 1e6 px/s².
+ */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.Physique = root.Matter = factory();
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  // ---------------------------------------------------------------------------
+  // Vector
+  // ---------------------------------------------------------------------------
+  const Vector = {
+    create: (x = 0, y = 0) => ({ x, y }),
+    clone: (v) => ({ x: v.x, y: v.y }),
+    add: (a, b) => ({ x: a.x + b.x, y: a.y + b.y }),
+    sub: (a, b) => ({ x: a.x - b.x, y: a.y - b.y }),
+    mult: (v, s) => ({ x: v.x * s, y: v.y * s }),
+    neg: (v) => ({ x: -v.x, y: -v.y }),
+    dot: (a, b) => a.x * b.x + a.y * b.y,
+    cross: (a, b) => a.x * b.y - a.y * b.x,
+    // s × v (scalaire × vecteur) : vitesse tangentielle d'un point à distance v
+    crossSV: (s, v) => ({ x: -s * v.y, y: s * v.x }),
+    perp: (v) => ({ x: -v.y, y: v.x }),
+    magnitude: (v) => Math.sqrt(v.x * v.x + v.y * v.y),
+    magnitudeSquared: (v) => v.x * v.x + v.y * v.y,
+    normalise: (v) => {
+      const m = Math.sqrt(v.x * v.x + v.y * v.y);
+      return m === 0 ? { x: 0, y: 0 } : { x: v.x / m, y: v.y / m };
+    },
+    rotate: (v, angle) => {
+      const c = Math.cos(angle), s = Math.sin(angle);
+      return { x: v.x * c - v.y * s, y: v.x * s + v.y * c };
+    },
+  };
+  const V = Vector;
+
+  // ---------------------------------------------------------------------------
+  // Common
+  // ---------------------------------------------------------------------------
+  const Common = {
+    _nextId: 1,
+    nextId() { return Common._nextId++; },
+    clamp: (v, min, max) => (v < min ? min : v > max ? max : v),
+    isElement: (o) => typeof HTMLElement !== 'undefined' && o instanceof HTMLElement,
+    choose: (arr) => arr[Math.floor(Math.random() * arr.length)],
+    colors: ['#f19648', '#f5d259', '#f55a3c', '#063e7b', '#ececd1', '#4ecdc4', '#c44dff', '#7bd389'],
+  };
+
+  // ---------------------------------------------------------------------------
+  // Events
+  // ---------------------------------------------------------------------------
+  const Events = {
+    on(object, names, callback) {
+      object.events = object.events || {};
+      for (const name of names.split(' ')) (object.events[name] = object.events[name] || []).push(callback);
+      return callback;
+    },
+    off(object, names, callback) {
+      if (!object.events) return;
+      if (!names) { object.events = {}; return; }
+      for (const name of names.split(' ')) {
+        if (!callback) delete object.events[name];
+        else if (object.events[name]) object.events[name] = object.events[name].filter((c) => c !== callback);
+      }
+    },
+    trigger(object, name, event = {}) {
+      const list = object.events && object.events[name];
+      if (!list || !list.length) return;
+      event.name = name;
+      event.source = object;
+      for (const cb of list.slice()) cb(event);
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Vertices
+  // ---------------------------------------------------------------------------
+  const Vertices = {
+    area(verts, signed) {
+      let a = 0;
+      for (let i = 0; i < verts.length; i++) a += V.cross(verts[i], verts[(i + 1) % verts.length]);
+      a /= 2;
+      return signed ? a : Math.abs(a);
+    },
+    centre(verts) {
+      const a = Vertices.area(verts, true);
+      let cx = 0, cy = 0;
+      for (let i = 0; i < verts.length; i++) {
+        const p = verts[i], q = verts[(i + 1) % verts.length], c = V.cross(p, q);
+        cx += (p.x + q.x) * c;
+        cy += (p.y + q.y) * c;
+      }
+      return { x: cx / (6 * a), y: cy / (6 * a) };
+    },
+    // Moment d'inertie (par unité de densité) autour de l'origine
+    inertia(verts) {
+      let num = 0;
+      for (let i = 0; i < verts.length; i++) {
+        const a = verts[i], b = verts[(i + 1) % verts.length], c = V.cross(a, b);
+        num += c * (V.dot(a, a) + V.dot(a, b) + V.dot(b, b));
+      }
+      return num / 12;
+    },
+    contains(verts, p) {
+      for (let i = 0; i < verts.length; i++) {
+        const a = verts[i], b = verts[(i + 1) % verts.length];
+        if (V.cross(V.sub(b, a), V.sub(p, a)) < 0) return false;
+      }
+      return true;
+    },
+    // Enveloppe convexe (monotone chain), utile pour fromVertices
+    hull(points) {
+      const pts = points.map(V.clone).sort((a, b) => a.x - b.x || a.y - b.y);
+      if (pts.length < 3) return pts;
+      const cross = (o, a, b) => V.cross(V.sub(a, o), V.sub(b, o));
+      const lower = [], upper = [];
+      for (const p of pts) {
+        while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+        lower.push(p);
+      }
+      for (let i = pts.length - 1; i >= 0; i--) {
+        const p = pts[i];
+        while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+        upper.push(p);
+      }
+      upper.pop(); lower.pop();
+      return lower.concat(upper);
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Body
+  // ---------------------------------------------------------------------------
+  const Body = {
+    create(options = {}) {
+      const body = {
+        id: Common.nextId(),
+        type: 'body',
+        label: 'Body',
+        position: { x: 0, y: 0 },
+        velocity: { x: 0, y: 0 },
+        angle: 0,
+        angularVelocity: 0,
+        force: { x: 0, y: 0 },
+        torque: 0,
+        density: 0.001,
+        friction: 0.1,
+        frictionStatic: 0.5,
+        frictionAir: 0.01,
+        restitution: 0,
+        isStatic: false,
+        isSensor: false,
+        circleRadius: 0,
+        vertices: [],
+        localVertices: [],
+        axes: [],
+        bounds: { min: { x: 0, y: 0 }, max: { x: 0, y: 0 } },
+        plugin: {},
+      };
+
+      const { render, collisionFilter, vertices, position, velocity, ...rest } = options;
+      Object.assign(body, rest);
+      body.position = position ? V.clone(position) : body.position;
+      body.velocity = velocity ? V.clone(velocity) : body.velocity;
+      body.render = Object.assign(
+        { visible: true, fillStyle: Common.choose(Common.colors), strokeStyle: null, lineWidth: 1, opacity: 1 },
+        render
+      );
+      body.collisionFilter = Object.assign({ group: 0, category: 0x0001, mask: 0xffffffff }, collisionFilter);
+
+      Body.setVertices(body, vertices || [{ x: -20, y: -20 }, { x: 20, y: -20 }, { x: 20, y: 20 }, { x: -20, y: 20 }]);
+
+      if (options.mass !== undefined) Body.setMass(body, options.mass);
+      if (body.isStatic) { body.isStatic = false; Body.setStatic(body, true); }
+      return body;
+    },
+
+    // Les sommets sont donnés relativement à la position du corps (non tournés)
+    setVertices(body, verts) {
+      let local = verts.map(V.clone);
+      if (Vertices.area(local, true) < 0) local.reverse();
+      const c = Vertices.centre(local);
+      local = local.map((v) => V.sub(v, c));
+      body.localVertices = local;
+      body.area = Vertices.area(local);
+      Body.setDensity(body, body.density);
+      Body.updateVertices(body);
+    },
+
+    setDensity(body, density) {
+      body.density = density;
+      body.mass = density * body.area;
+      body.inertia = density * Vertices.inertia(body.localVertices);
+      body.inverseMass = body.isStatic ? 0 : 1 / body.mass;
+      body.inverseInertia = body.isStatic ? 0 : 1 / body.inertia;
+    },
+
+    setMass(body, mass) {
+      const ratio = mass / body.mass;
+      body.mass = mass;
+      body.density = mass / body.area;
+      body.inertia *= ratio;
+      body.inverseMass = body.isStatic ? 0 : 1 / body.mass;
+      body.inverseInertia = body.isStatic ? 0 : 1 / body.inertia;
+    },
+
+    setStatic(body, isStatic) {
+      if (isStatic === body.isStatic) return;
+      body.isStatic = isStatic;
+      if (isStatic) {
+        body._original = { mass: body.mass, inertia: body.inertia, restitution: body.restitution, friction: body.friction };
+        body.inverseMass = 0;
+        body.inverseInertia = 0;
+        body.velocity = { x: 0, y: 0 };
+        body.angularVelocity = 0;
+        if (body.render.fillStyle && !body.render._userColor) body.render.fillStyle = '#3a3d4d';
+      } else {
+        if (body._original) { body.mass = body._original.mass; body.inertia = body._original.inertia; }
+        body.inverseMass = 1 / body.mass;
+        body.inverseInertia = 1 / body.inertia;
+      }
+    },
+
+    updateVertices(body) {
+      const c = Math.cos(body.angle), s = Math.sin(body.angle);
+      const px = body.position.x, py = body.position.y;
+      const lv = body.localVertices;
+      const n = lv.length;
+      if (body.vertices.length !== n) body.vertices = lv.map(() => ({ x: 0, y: 0 }));
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (let i = 0; i < n; i++) {
+        const l = lv[i], w = body.vertices[i];
+        w.x = px + l.x * c - l.y * s;
+        w.y = py + l.x * s + l.y * c;
+        if (w.x < minX) minX = w.x; if (w.x > maxX) maxX = w.x;
+        if (w.y < minY) minY = w.y; if (w.y > maxY) maxY = w.y;
+      }
+      body.bounds.min.x = minX; body.bounds.min.y = minY;
+      body.bounds.max.x = maxX; body.bounds.max.y = maxY;
+      body.axes = null; // recalculés à la demande
+    },
+
+    getAxes(body) {
+      if (body.axes) return body.axes;
+      const verts = body.vertices, axes = [];
+      for (let i = 0; i < verts.length; i++) {
+        const a = verts[i], b = verts[(i + 1) % verts.length];
+        axes.push(V.normalise({ x: b.y - a.y, y: a.x - b.x })); // normale sortante
+      }
+      return (body.axes = axes);
+    },
+
+    setPosition(body, position) { body.position = V.clone(position); Body.updateVertices(body); },
+    setAngle(body, angle) { body.angle = angle; Body.updateVertices(body); },
+    translate(body, t) { Body.setPosition(body, V.add(body.position, t)); },
+    rotate(body, r) { Body.setAngle(body, body.angle + r); },
+    setVelocity(body, v) { body.velocity = V.clone(v); },
+    setAngularVelocity(body, w) { body.angularVelocity = w; },
+
+    // force en (masse·px/s²), appliquée au point `position` (coordonnées monde)
+    applyForce(body, position, force) {
+      body.force.x += force.x;
+      body.force.y += force.y;
+      body.torque += V.cross(V.sub(position, body.position), force);
+    },
+
+    scale(body, sx, sy = sx) {
+      Body.setVertices(body, body.localVertices.map((v) => ({ x: v.x * sx, y: v.y * sy })));
+      if (body.circleRadius) body.circleRadius *= sx;
+      if (body.isStatic) { body.inverseMass = 0; body.inverseInertia = 0; }
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Bodies (fabriques)
+  // ---------------------------------------------------------------------------
+  function withPos(x, y, options, extra) {
+    const o = Object.assign({}, options, extra, { position: { x, y } });
+    if (options && options.render && options.render.fillStyle) {
+      o.render = Object.assign({}, options.render, { _userColor: true });
+    }
+    return o;
+  }
+
+  const Bodies = {
+    rectangle(x, y, width, height, options = {}) {
+      const w = width / 2, h = height / 2;
+      return Body.create(withPos(x, y, options, {
+        label: options.label || 'Rectangle Body',
+        vertices: [{ x: -w, y: -h }, { x: w, y: -h }, { x: w, y: h }, { x: -w, y: h }],
+      }));
+    },
+
+    circle(x, y, radius, options = {}, maxSides = 26) {
+      // comme Matter.js, un cercle est approximé par un polygone régulier
+      let sides = Math.ceil(Math.max(10, Math.min(maxSides, radius)));
+      if (sides % 2 === 1) sides += 1;
+      const body = Bodies.polygon(x, y, sides, radius, Object.assign({ label: 'Circle Body' }, options));
+      body.circleRadius = radius;
+      return body;
+    },
+
+    polygon(x, y, sides, radius, options = {}) {
+      sides = Math.max(3, sides | 0);
+      const theta = (2 * Math.PI) / sides, offset = theta * 0.5, verts = [];
+      for (let i = 0; i < sides; i++) {
+        const a = offset + i * theta;
+        verts.push({ x: Math.cos(a) * radius, y: Math.sin(a) * radius });
+      }
+      return Body.create(withPos(x, y, options, { label: options.label || 'Polygon Body', vertices: verts }));
+    },
+
+    trapezoid(x, y, width, height, slope, options = {}) {
+      slope *= 0.5;
+      const roof = (1 - slope * 2) * width;
+      const x1 = width * slope, x2 = x1 + roof, x3 = x2 + x1;
+      const verts = [{ x: 0, y: 0 }, { x: x1, y: -height }, { x: x2, y: -height }, { x: x3, y: 0 }];
+      return Body.create(withPos(x, y, options, { label: options.label || 'Trapezoid Body', vertices: verts }));
+    },
+
+    // Les sommets sont en coordonnées absolues ou relatives ; le corps est centré en (x, y).
+    // Les formes concaves sont remplacées par leur enveloppe convexe.
+    fromVertices(x, y, vertexSets, options = {}) {
+      const verts = Array.isArray(vertexSets[0]) ? vertexSets.flat() : vertexSets;
+      return Body.create(withPos(x, y, options, { label: options.label || 'Body', vertices: Vertices.hull(verts) }));
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // World / Composite
+  // ---------------------------------------------------------------------------
+  const World = {
+    create(options = {}) {
+      return {
+        id: Common.nextId(),
+        type: 'composite',
+        label: 'World',
+        bodies: [],
+        gravity: Object.assign({ x: 0, y: 1, scale: 0.001 }, options.gravity),
+        bounds: options.bounds || { min: { x: -Infinity, y: -Infinity }, max: { x: Infinity, y: Infinity } },
+      };
+    },
+    add(world, object) {
+      const list = Array.isArray(object) ? object : [object];
+      for (const o of list) {
+        if (o && o.type === 'composite') World.add(world, o.bodies);
+        else if (o && o.type === 'body' && !world.bodies.includes(o)) world.bodies.push(o);
+      }
+      return world;
+    },
+    addBody(world, body) { return World.add(world, body); },
+    remove(world, object) {
+      const list = new Set(Array.isArray(object) ? object : [object]);
+      world.bodies = world.bodies.filter((b) => !list.has(b));
+      return world;
+    },
+    clear(world, keepStatic = false) {
+      world.bodies = keepStatic ? world.bodies.filter((b) => b.isStatic) : [];
+      return world;
+    },
+    allBodies: (world) => world.bodies.slice(),
+  };
+  const Composite = World;
+
+  // ---------------------------------------------------------------------------
+  // Detector : SAT + clipping
+  // ---------------------------------------------------------------------------
+  function project(verts, axis) {
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < verts.length; i++) {
+      const d = verts[i].x * axis.x + verts[i].y * axis.y;
+      if (d < min) min = d;
+      if (d > max) max = d;
+    }
+    return { min, max };
+  }
+
+  function canCollide(a, b) {
+    if (a.group === b.group && a.group !== 0) return a.group > 0;
+    return (a.mask & b.category) !== 0 && (b.mask & a.category) !== 0;
+  }
+
+  // Arête de `verts` la plus perpendiculaire à n, autour du sommet le plus loin selon n
+  function bestEdge(verts, n) {
+    let best = 0, max = -Infinity;
+    for (let i = 0; i < verts.length; i++) {
+      const d = V.dot(verts[i], n);
+      if (d > max) { max = d; best = i; }
+    }
+    const len = verts.length;
+    const v = verts[best], prev = verts[(best - 1 + len) % len], next = verts[(best + 1) % len];
+    const l = V.normalise(V.sub(v, next)), r = V.normalise(V.sub(v, prev));
+    if (Math.abs(V.dot(r, n)) <= Math.abs(V.dot(l, n))) return { max: v, a: prev, b: v };
+    return { max: v, a: v, b: next };
+  }
+
+  function clip(p1, p2, n, o) {
+    const out = [];
+    const d1 = V.dot(n, p1) - o, d2 = V.dot(n, p2) - o;
+    if (d1 >= 0) out.push(p1);
+    if (d2 >= 0) out.push(p2);
+    if (d1 * d2 < 0) out.push(V.add(p1, V.mult(V.sub(p2, p1), d1 / (d1 - d2))));
+    return out;
+  }
+
+  const Detector = {
+    collides(bodyA, bodyB) {
+      let depth = Infinity, normal = null;
+      const vA = bodyA.vertices, vB = bodyB.vertices;
+      for (const axes of [Body.getAxes(bodyA), Body.getAxes(bodyB)]) {
+        for (let i = 0; i < axes.length; i++) {
+          const axis = axes[i];
+          const pa = project(vA, axis), pb = project(vB, axis);
+          const overlap = Math.min(pa.max, pb.max) - Math.max(pa.min, pb.min);
+          if (overlap <= 0) return null;
+          if (overlap < depth) {
+            depth = overlap;
+            // orienter la normale de A vers B
+            normal = (pa.min + pa.max) * 0.5 <= (pb.min + pb.max) * 0.5 ? axis : V.neg(axis);
+          }
+        }
+      }
+
+      // --- points de contact par clipping (arête de référence / arête incidente)
+      const e1 = bestEdge(vA, normal), e2 = bestEdge(vB, V.neg(normal));
+      let ref, inc, refOut;
+      const d1 = V.normalise(V.sub(e1.b, e1.a)), d2 = V.normalise(V.sub(e2.b, e2.a));
+      if (Math.abs(V.dot(d1, normal)) <= Math.abs(V.dot(d2, normal))) { ref = e1; inc = e2; refOut = normal; }
+      else { ref = e2; inc = e1; refOut = V.neg(normal); }
+
+      const refv = V.normalise(V.sub(ref.b, ref.a));
+      let cp = clip(inc.a, inc.b, refv, V.dot(refv, ref.a));
+      if (cp.length >= 2) cp = clip(cp[0], cp[1], V.neg(refv), -V.dot(refv, ref.b));
+
+      let faceN = V.perp(refv);
+      if (V.dot(faceN, refOut) < 0) faceN = V.neg(faceN);
+      const faceD = V.dot(faceN, ref.max);
+
+      const contacts = [];
+      if (cp.length >= 2) {
+        for (const p of cp.slice(0, 2)) {
+          const sep = faceD - V.dot(faceN, p);
+          if (sep >= -0.01) contacts.push({ point: p, depth: Math.max(sep, 0) });
+        }
+      }
+      if (!contacts.length) {
+        // repli : sommet le plus profond de B dans la direction -n
+        contacts.push({ point: e2.max, depth });
+      }
+
+      return { bodyA, bodyB, normal, depth, contacts };
+    },
+
+    // Broadphase naïve O(n²) sur les AABB, suffisante pour quelques centaines de corps
+    detect(bodies) {
+      const collisions = [];
+      const n = bodies.length;
+      for (let i = 0; i < n; i++) {
+        const a = bodies[i];
+        for (let j = i + 1; j < n; j++) {
+          const b = bodies[j];
+          if (a.isStatic && b.isStatic) continue;
+          if (a.bounds.max.x < b.bounds.min.x || b.bounds.max.x < a.bounds.min.x ||
+              a.bounds.max.y < b.bounds.min.y || b.bounds.max.y < a.bounds.min.y) continue;
+          if (!canCollide(a.collisionFilter, b.collisionFilter)) continue;
+          const c = Detector.collides(a, b);
+          if (c) collisions.push(c);
+        }
+      }
+      return collisions;
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Resolver : impulsions séquentielles
+  // ---------------------------------------------------------------------------
+  const Resolver = {
+    restingThreshold: 30, // px/s : en dessous, pas de rebond
+    slop: 0.5,            // px de pénétration tolérés
+    positionCorrection: 0.2,
+    maxCorrection: 4,     // px max corrigés par itération
+    warmStarting: 1,
+
+    applyImpulse(a, b, r1, r2, P) {
+      a.velocity.x -= P.x * a.inverseMass; a.velocity.y -= P.y * a.inverseMass;
+      a.angularVelocity -= a.inverseInertia * V.cross(r1, P);
+      b.velocity.x += P.x * b.inverseMass; b.velocity.y += P.y * b.inverseMass;
+      b.angularVelocity += b.inverseInertia * V.cross(r2, P);
+    },
+
+    relativeVelocity(a, b, r1, r2) {
+      const va = V.add(a.velocity, V.crossSV(a.angularVelocity, r1));
+      const vb = V.add(b.velocity, V.crossSV(b.angularVelocity, r2));
+      return V.sub(vb, va);
+    },
+
+    preSolve(pairs) {
+      for (const pair of pairs) {
+        const { bodyA: a, bodyB: b, normal: n } = pair;
+        if (pair.isSensor) continue;
+        const t = V.perp(n);
+        pair.tangent = t;
+        for (const c of pair.contacts) {
+          c.r1 = V.sub(c.point, a.position);
+          c.r2 = V.sub(c.point, b.position);
+          const rn1 = V.cross(c.r1, n), rn2 = V.cross(c.r2, n);
+          const rt1 = V.cross(c.r1, t), rt2 = V.cross(c.r2, t);
+          const invM = a.inverseMass + b.inverseMass;
+          c.massNormal = 1 / (invM + a.inverseInertia * rn1 * rn1 + b.inverseInertia * rn2 * rn2);
+          c.massTangent = 1 / (invM + a.inverseInertia * rt1 * rt1 + b.inverseInertia * rt2 * rt2);
+
+          const vn = V.dot(Resolver.relativeVelocity(a, b, c.r1, c.r2), n);
+          c.bounce = vn < -Resolver.restingThreshold ? -pair.restitution * vn : 0;
+
+          // warm starting : réappliquer les impulsions du pas précédent
+          if (c.Pn || c.Pt) {
+            const P = V.add(V.mult(n, c.Pn), V.mult(t, c.Pt));
+            Resolver.applyImpulse(a, b, c.r1, c.r2, P);
+          }
+        }
+      }
+    },
+
+    solveVelocity(pairs, iterations) {
+      for (let it = 0; it < iterations; it++) {
+        for (const pair of pairs) {
+          if (pair.isSensor) continue;
+          const { bodyA: a, bodyB: b, normal: n, tangent: t } = pair;
+          for (const c of pair.contacts) {
+            // normale
+            let dv = Resolver.relativeVelocity(a, b, c.r1, c.r2);
+            const vn = V.dot(dv, n);
+            let dPn = c.massNormal * (c.bounce - vn);
+            const Pn0 = c.Pn;
+            c.Pn = Math.max(Pn0 + dPn, 0);
+            dPn = c.Pn - Pn0;
+            Resolver.applyImpulse(a, b, c.r1, c.r2, V.mult(n, dPn));
+
+            // friction (Coulomb), coefficient statique tant que le contact adhère
+            dv = Resolver.relativeVelocity(a, b, c.r1, c.r2);
+            const vt = V.dot(dv, t);
+            let dPt = -c.massTangent * vt;
+            const mu = Math.abs(vt) < 5 ? pair.frictionStatic : pair.friction;
+            const maxPt = mu * c.Pn;
+            const Pt0 = c.Pt;
+            c.Pt = Common.clamp(Pt0 + dPt, -maxPt, maxPt);
+            dPt = c.Pt - Pt0;
+            Resolver.applyImpulse(a, b, c.r1, c.r2, V.mult(t, dPt));
+          }
+        }
+      }
+    },
+
+    // Correction de pénétration par point de contact (translation + rotation).
+    // La pénétration restante est estimée à partir du déplacement de chaque corps
+    // depuis la détection, ce qui évite de recalculer la géométrie à chaque itération.
+    solvePosition(pairs, iterations) {
+      const displacement = (body, r) => {
+        const dθ = body.angle - body._prevAngle;
+        const rr = V.rotate(r, dθ);
+        return { x: body.position.x - body._prev.x + rr.x - r.x, y: body.position.y - body._prev.y + rr.y - r.y };
+      };
+      for (let it = 0; it < iterations; it++) {
+        for (const pair of pairs) {
+          if (pair.isSensor) continue;
+          const { bodyA: a, bodyB: b, normal: n } = pair;
+          if (a.inverseMass + b.inverseMass === 0) continue;
+          for (const c of pair.contacts) {
+            const moved = V.dot(n, V.sub(displacement(b, c.r2), displacement(a, c.r1)));
+            const remaining = c.depth - moved - Resolver.slop;
+            if (remaining <= 0) continue;
+            const corr = Math.min(remaining * Resolver.positionCorrection, Resolver.maxCorrection) * c.massNormal;
+            const P = V.mult(n, corr);
+            a.position.x -= P.x * a.inverseMass; a.position.y -= P.y * a.inverseMass;
+            a.angle -= a.inverseInertia * V.cross(c.r1, P);
+            b.position.x += P.x * b.inverseMass; b.position.y += P.y * b.inverseMass;
+            b.angle += b.inverseInertia * V.cross(c.r2, P);
+          }
+        }
+      }
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Engine
+  // ---------------------------------------------------------------------------
+  const Engine = {
+    /**
+     * Engine.create(options) ou Engine.create(element, options) (ancienne API Matter.js :
+     * si un élément DOM est fourni, un rendu canvas y est créé automatiquement).
+     */
+    create(element, options) {
+      if (!Common.isElement(element)) { options = element; element = null; }
+      options = options || {};
+      const engine = {
+        world: options.world || World.create(options),
+        timing: { timestamp: 0, timeScale: 1 },
+        velocityIterations: options.velocityIterations || 10,
+        positionIterations: options.positionIterations || 6,
+        pairs: new Map(),
+        events: {},
+      };
+      if (options.gravity) Object.assign(engine.world.gravity, options.gravity);
+      engine.gravity = engine.world.gravity;
+      if (element) {
+        engine.render = Render.create(Object.assign({ element, engine }, options.render ? { options: options.render } : {}));
+      }
+      return engine;
+    },
+
+    update(engine, delta = 1000 / 60) {
+      const dt = (delta / 1000) * engine.timing.timeScale;
+      if (dt <= 0) return engine;
+      const world = engine.world;
+      const bodies = world.bodies;
+      const g = world.gravity;
+      const gx = g.x * g.scale * 1e6, gy = g.y * g.scale * 1e6;
+      engine.timing.timestamp += delta * engine.timing.timeScale;
+
+      Events.trigger(engine, 'beforeUpdate', { timestamp: engine.timing.timestamp, delta });
+
+      // 1. forces -> vitesses
+      for (const b of bodies) {
+        if (b.isStatic) continue;
+        b.velocity.x += (gx + b.force.x * b.inverseMass) * dt;
+        b.velocity.y += (gy + b.force.y * b.inverseMass) * dt;
+        b.angularVelocity += b.torque * b.inverseInertia * dt;
+        const air = Math.pow(1 - b.frictionAir, dt * 60);
+        b.velocity.x *= air; b.velocity.y *= air;
+        b.angularVelocity *= air;
+      }
+
+      // 2. collisions
+      const collisions = Detector.detect(bodies);
+      const pairs = [];
+      const newPairs = new Map();
+      const started = [], active = [];
+      for (const c of collisions) {
+        const key = c.bodyA.id < c.bodyB.id ? c.bodyA.id + ':' + c.bodyB.id : c.bodyB.id + ':' + c.bodyA.id;
+        const old = engine.pairs.get(key);
+        const a = c.bodyA, b = c.bodyB;
+        const pair = Object.assign(c, {
+          id: key,
+          isSensor: a.isSensor || b.isSensor,
+          friction: Math.min(a.friction, b.friction),
+          frictionStatic: Math.min(a.friction, b.friction) * (1 + Math.max(a.frictionStatic, b.frictionStatic)),
+          restitution: Math.max(a.restitution, b.restitution),
+        });
+        for (const ct of pair.contacts) {
+          ct.Pn = 0; ct.Pt = 0;
+          if (old && V.dot(old.normal, pair.normal) > 0.95) {
+            for (const oc of old.contacts) {
+              if (V.magnitudeSquared(V.sub(oc.point, ct.point)) < 16) {
+                ct.Pn = oc.Pn * Resolver.warmStarting;
+                ct.Pt = oc.Pt * Resolver.warmStarting;
+                break;
+              }
+            }
+          }
+        }
+        newPairs.set(key, pair);
+        pairs.push(pair);
+        (old ? active : started).push(pair);
+      }
+      const ended = [];
+      for (const [key, p] of engine.pairs) if (!newPairs.has(key)) ended.push(p);
+      engine.pairs = newPairs;
+
+      // 3. vitesses
+      Resolver.preSolve(pairs);
+      Resolver.solveVelocity(pairs, engine.velocityIterations);
+
+      // 4. vitesses -> positions
+      for (const b of bodies) {
+        b._prev = { x: b.position.x, y: b.position.y };
+        b._prevAngle = b.angle;
+        if (b.isStatic) continue;
+        b.position.x += b.velocity.x * dt;
+        b.position.y += b.velocity.y * dt;
+        b.angle += b.angularVelocity * dt;
+      }
+
+      // 5. correction de pénétration
+      Resolver.solvePosition(pairs, engine.positionIterations);
+
+      for (const b of bodies) {
+        if (!b.isStatic) Body.updateVertices(b);
+        b.force.x = 0; b.force.y = 0; b.torque = 0;
+      }
+
+      if (started.length) Events.trigger(engine, 'collisionStart', { pairs: started });
+      if (active.length) Events.trigger(engine, 'collisionActive', { pairs: active });
+      if (ended.length) Events.trigger(engine, 'collisionEnd', { pairs: ended });
+      Events.trigger(engine, 'afterUpdate', { timestamp: engine.timing.timestamp, delta });
+      return engine;
+    },
+
+    // Boucle d'animation à pas fixe (1000/60 ms)
+    run(engine) {
+      return Runner.run(engine);
+    },
+
+    clear(engine) {
+      engine.pairs = new Map();
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Runner
+  // ---------------------------------------------------------------------------
+  const Runner = {
+    run(runner, engine) {
+      if (!engine) { engine = runner; runner = {}; }
+      runner = Object.assign(runner, { delta: 1000 / 60, enabled: true, accumulator: 0, last: null, engine });
+      const raf = typeof requestAnimationFrame !== 'undefined' ? requestAnimationFrame : (f) => setTimeout(() => f(Date.now()), 16);
+      const tick = (time) => {
+        if (!runner.enabled) return;
+        if (runner.last === null) runner.last = time;
+        runner.accumulator += Math.min(time - runner.last, 100);
+        runner.last = time;
+        let steps = 0;
+        while (runner.accumulator >= runner.delta && steps < 4) {
+          Engine.update(engine, runner.delta);
+          runner.accumulator -= runner.delta;
+          steps++;
+        }
+        if (steps === 4) runner.accumulator = 0;
+        if (engine.render) Render.world(engine.render);
+        runner.frame = raf(tick);
+      };
+      runner.frame = raf(tick);
+      engine.runner = runner;
+      return runner;
+    },
+    stop(runner) { runner.enabled = false; },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Render (canvas 2D)
+  // ---------------------------------------------------------------------------
+  const Render = {
+    create(config = {}) {
+      const options = Object.assign({
+        width: 800, height: 600, background: '#14151f', wireframes: false,
+        showAngleIndicator: true, showCollisions: false, pixelRatio: (typeof devicePixelRatio !== 'undefined' ? devicePixelRatio : 1),
+      }, config.options);
+      const canvas = config.canvas || document.createElement('canvas');
+      canvas.width = options.width * options.pixelRatio;
+      canvas.height = options.height * options.pixelRatio;
+      canvas.style.width = options.width + 'px';
+      canvas.style.height = options.height + 'px';
+      canvas.style.maxWidth = '100%';
+      if (config.element && !canvas.parentNode) config.element.appendChild(canvas);
+      const render = { canvas, context: canvas.getContext('2d'), engine: config.engine, options };
+      if (config.engine) {
+        config.engine.render = render;
+        Events.on(config.engine, 'afterUpdate', (e) => { render._lastPairs = config.engine.pairs; });
+      }
+      return render;
+    },
+
+    // Boucle de rendu seule (si la physique est mise à jour ailleurs)
+    run(render) {
+      const loop = () => { Render.world(render); render.frame = requestAnimationFrame(loop); };
+      loop();
+    },
+    stop(render) { cancelAnimationFrame(render.frame); },
+
+    world(render) {
+      const { context: ctx, options: o, engine } = render;
+      const pr = o.pixelRatio;
+      ctx.setTransform(pr, 0, 0, pr, 0, 0);
+      ctx.fillStyle = o.wireframes ? '#0f0f13' : o.background;
+      ctx.fillRect(0, 0, o.width, o.height);
+
+      for (const b of engine.world.bodies) {
+        if (!b.render.visible) continue;
+        const v = b.vertices;
+        ctx.globalAlpha = b.render.opacity;
+        ctx.beginPath();
+        if (b.circleRadius) ctx.arc(b.position.x, b.position.y, b.circleRadius, 0, Math.PI * 2);
+        else {
+          ctx.moveTo(v[0].x, v[0].y);
+          for (let i = 1; i < v.length; i++) ctx.lineTo(v[i].x, v[i].y);
+          ctx.closePath();
+        }
+        if (o.wireframes || b.isSensor) {
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = b.isSensor ? '#4ecdc4' : '#bbb';
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = b.render.fillStyle;
+          ctx.fill();
+          if (b.render.strokeStyle) {
+            ctx.lineWidth = b.render.lineWidth;
+            ctx.strokeStyle = b.render.strokeStyle;
+            ctx.stroke();
+          }
+        }
+        if (o.showAngleIndicator && !b.isStatic) {
+          const len = b.circleRadius || V.magnitude(b.localVertices[0]) * 0.7;
+          const tip = V.add(b.position, V.rotate({ x: len, y: 0 }, b.angle));
+          ctx.beginPath();
+          ctx.moveTo(b.position.x, b.position.y);
+          ctx.lineTo(tip.x, tip.y);
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+          ctx.stroke();
+        }
+      }
+      ctx.globalAlpha = 1;
+
+      if (o.showCollisions && engine.pairs) {
+        ctx.fillStyle = '#ff4d6d';
+        for (const p of engine.pairs.values()) {
+          for (const c of p.contacts) { ctx.beginPath(); ctx.arc(c.point.x, c.point.y, 2.5, 0, Math.PI * 2); ctx.fill(); }
+        }
+      }
+
+      if (render.mouse && render.mouse.body) {
+        const m = render.mouse;
+        const anchor = V.add(m.body.position, V.rotate(m.localAnchor, m.body.angle));
+        ctx.beginPath();
+        ctx.moveTo(anchor.x, anchor.y);
+        ctx.lineTo(m.position.x, m.position.y);
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Mouse + MouseConstraint : attraper et lancer des corps
+  // ---------------------------------------------------------------------------
+  const Query = {
+    point(bodies, point) {
+      return bodies.filter((b) =>
+        point.x >= b.bounds.min.x && point.x <= b.bounds.max.x &&
+        point.y >= b.bounds.min.y && point.y <= b.bounds.max.y &&
+        Vertices.contains(b.vertices, point));
+    },
+  };
+
+  const MouseConstraint = {
+    create(engine, options = {}) {
+      const element = options.element || (engine.render && engine.render.canvas);
+      const mc = { type: 'mouseConstraint', position: { x: 0, y: 0 }, body: null, localAnchor: null, down: false, stiffness: options.stiffness || 0.2 };
+      if (engine.render) engine.render.mouse = mc;
+
+      const toLocal = (e) => {
+        const r = element.getBoundingClientRect();
+        const w = engine.render ? engine.render.options.width : r.width;
+        const h = engine.render ? engine.render.options.height : r.height;
+        const p = e.touches ? e.touches[0] || e.changedTouches[0] : e;
+        return { x: ((p.clientX - r.left) / r.width) * w, y: ((p.clientY - r.top) / r.height) * h };
+      };
+      const down = (e) => {
+        mc.position = toLocal(e);
+        mc.down = true;
+        const hit = Query.point(engine.world.bodies, mc.position).filter((b) => !b.isStatic);
+        if (hit.length) {
+          mc.body = hit[hit.length - 1];
+          mc.localAnchor = V.rotate(V.sub(mc.position, mc.body.position), -mc.body.angle);
+          Events.trigger(mc, 'startdrag', { body: mc.body });
+          e.preventDefault();
+        }
+        Events.trigger(mc, 'mousedown', { position: mc.position, body: mc.body });
+      };
+      const move = (e) => { mc.position = toLocal(e); if (mc.body) e.preventDefault(); };
+      const up = () => {
+        if (mc.body) Events.trigger(mc, 'enddrag', { body: mc.body });
+        mc.down = false; mc.body = null;
+        Events.trigger(mc, 'mouseup', { position: mc.position });
+      };
+      element.addEventListener('mousedown', down);
+      element.addEventListener('touchstart', down, { passive: false });
+      window.addEventListener('mousemove', move);
+      element.addEventListener('touchmove', move, { passive: false });
+      window.addEventListener('mouseup', up);
+      window.addEventListener('touchend', up);
+
+      // contrainte de point douce résolue par une matrice de masse effective 2x2
+      Events.on(engine, 'beforeUpdate', (ev) => {
+        const b = mc.body;
+        if (!b) return;
+        const dt = ev.delta / 1000;
+        const r = V.rotate(mc.localAnchor, b.angle);
+        const anchor = V.add(b.position, r);
+        const target = V.mult(V.sub(mc.position, anchor), mc.stiffness / dt);
+        const va = V.add(b.velocity, V.crossSV(b.angularVelocity, r));
+        // compense la gravité de ce pas
+        const g = engine.world.gravity, gs = g.scale * 1e6 * dt;
+        const err = V.sub(target, V.add(va, { x: g.x * gs, y: g.y * gs }));
+        const im = b.inverseMass, ii = b.inverseInertia;
+        const k11 = im + ii * r.y * r.y, k12 = -ii * r.x * r.y, k22 = im + ii * r.x * r.x;
+        const det = k11 * k22 - k12 * k12;
+        if (det === 0) return;
+        const P = { x: (k22 * err.x - k12 * err.y) / det, y: (k11 * err.y - k12 * err.x) / det };
+        b.velocity.x += P.x * im; b.velocity.y += P.y * im;
+        b.angularVelocity += ii * V.cross(r, P);
+        b.angularVelocity *= 0.98;
+      });
+      return mc;
+    },
+  };
+
+  return {
+    name: 'matter-like',
+    version: '1.0.0',
+    Vector, Common, Events, Vertices, Body, Bodies, World, Composite,
+    Detector, Resolver, Engine, Runner, Render, Mouse: MouseConstraint, MouseConstraint, Query,
+  };
+});
+
+  </script>
+  <script>
+    var container = document.getElementById('container');
+    var options = { render: { width: 800, height: 600 } };
+
+    // --- l'exemple d'origine (avec la coquille « enigne » corrigée)
+    var Bodies = Physique.Bodies;
+    var Engine = Physique.Engine;
+    var engine = Engine.create(container, options);
+    var World = Physique.World;
+
+    function scene() {
+      World.clear(engine.world);
+      World.addBody(engine.world, Bodies.rectangle(300, 180, 700, 20, { isStatic: true, angle: Math.PI * 0.06 }));
+      World.addBody(engine.world, Bodies.rectangle(300, 70, 40, 40, { friction: 0.001 }));
+
+      // décor : sol, murs, seconde rampe
+      World.add(engine.world, [
+        Bodies.rectangle(400, 610, 820, 40, { isStatic: true }),
+        Bodies.rectangle(-10, 300, 20, 600, { isStatic: true }),
+        Bodies.rectangle(810, 300, 20, 600, { isStatic: true }),
+        Bodies.rectangle(560, 380, 500, 20, { isStatic: true, angle: -Math.PI * 0.06 }),
+      ]);
+    }
+
+    function randomShape(x, y) {
+      var k = Math.floor(Math.random() * 4), s = 15 + Math.random() * 20;
+      if (k === 0) return Bodies.circle(x, y, s, { restitution: 0.5 });
+      if (k === 1) return Bodies.polygon(x, y, 3 + Math.floor(Math.random() * 5), s);
+      if (k === 2) return Bodies.trapezoid(x, y, s * 2, s * 1.4, 0.5);
+      return Bodies.rectangle(x, y, s * 2, s * 1.5);
+    }
+
+    scene();
+    var runner = Engine.run(engine);
+    var mouse = Physique.MouseConstraint.create(engine);
+
+    Physique.Events.on(mouse, 'mousedown', function (e) {
+      if (!e.body) World.add(engine.world, randomShape(e.position.x, e.position.y));
+    });
+
+    document.getElementById('reset').onclick = scene;
+    document.getElementById('pyramid').onclick = function () {
+      for (var row = 0; row < 8; row++)
+        for (var i = 0; i <= row; i++)
+          World.add(engine.world, Bodies.rectangle(150 + (i - row / 2) * 32, 420 + (row - 8) * 31, 30, 30));
+    };
+    document.getElementById('rain').onclick = function () {
+      for (var i = 0; i < 25; i++) World.add(engine.world, randomShape(60 + Math.random() * 680, -40 - Math.random() * 300));
+    };
+    document.getElementById('wire').onclick = function () { engine.render.options.wireframes = !engine.render.options.wireframes; };
+    document.getElementById('contacts').onclick = function () { engine.render.options.showCollisions = !engine.render.options.showCollisions; };
+    document.getElementById('pause').onclick = function () { engine.timing.timeScale = engine.timing.timeScale ? 0 : 1; this.textContent = engine.timing.timeScale ? 'Pause' : 'Lecture'; };
+
+    // retire les corps tombés hors du monde
+    Physique.Events.on(engine, 'afterUpdate', function () {
+      var gone = engine.world.bodies.filter(function (b) { return b.position.y > 1200; });
+      if (gone.length) World.remove(engine.world, gone);
+      document.getElementById('stats').textContent = engine.world.bodies.length + ' corps · ' + engine.pairs.size + ' contacts';
+    });
+  </script>
+</body>
+</html>
